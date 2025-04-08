@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #define PORT 8080
 #define BUFFER_SIZE 1024
@@ -11,8 +12,23 @@
 int main() {
     int sock;
     struct sockaddr_in server_address;
+    SSL_CTX *ctx;
+    SSL *ssl;
     char buffer[BUFFER_SIZE] = {0};
     char username[BUFFER_SIZE], password[BUFFER_SIZE];
+
+    // Initialize SSL library
+    SSL_library_init();
+    OpenSSL_add_all_algorithms();
+    SSL_load_error_strings();
+
+    // Create SSL context
+    const SSL_METHOD *method = TLS_client_method();
+    ctx = SSL_CTX_new(method);
+    if (!ctx) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
 
     // Create socket
     sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -32,33 +48,52 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    // Receive "Username: " prompt
-    read(sock, buffer, BUFFER_SIZE);
-    printf("%s", buffer);
-    fgets(username, BUFFER_SIZE, stdin);
-    send(sock, username, strlen(username), 0);
+    // Create SSL object
+    ssl = SSL_new(ctx);
+    SSL_set_fd(ssl, sock);
 
-    // Receive "Password: " prompt
-    memset(buffer, 0, BUFFER_SIZE);
-    read(sock, buffer, BUFFER_SIZE);
-    printf("%s", buffer);
-    fgets(password, BUFFER_SIZE, stdin);
-    send(sock, password, strlen(password), 0);
-
-    // Receive authentication result
-    memset(buffer, 0, BUFFER_SIZE);
-    read(sock, buffer, BUFFER_SIZE);
-    printf("%s\n", buffer);
-
-    // Send appropriate message to server
-    if (strstr(buffer, "Access Granted")) {
-        send(sock, "Client has entered the server", strlen("Client has entered the server"), 0);
-    } else {
-        send(sock, "Client entered wrong credentials", strlen("Client entered wrong credentials"), 0);
+    // Perform SSL handshake
+    if (SSL_connect(ssl) <= 0) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
     }
 
-    // Close socket
+    // Receive "Username: " prompt from server
+    SSL_read(ssl, buffer, BUFFER_SIZE);
+    printf("%s", buffer);
+    fgets(username, BUFFER_SIZE, stdin);
+    // Remove newline character from username
+    username[strcspn(username, "\n")] = 0;
+    // Send username to server
+    SSL_write(ssl, username, strlen(username));
+
+    // Receive "Password: " prompt from server
+    memset(buffer, 0, BUFFER_SIZE);
+    SSL_read(ssl, buffer, BUFFER_SIZE);
+    printf("%s", buffer);
+    fgets(password, BUFFER_SIZE, stdin);
+    // Remove newline character from password
+    password[strcspn(password, "\n")] = 0;
+    // Send password to server
+    SSL_write(ssl, password, strlen(password));
+
+    // Receive authentication result from server
+    memset(buffer, 0, BUFFER_SIZE);
+    SSL_read(ssl, buffer, BUFFER_SIZE);
+    printf("%s\n", buffer);
+
+    // Send appropriate message based on authentication result
+    if (strstr(buffer, "Access Granted")) {
+        SSL_write(ssl, "Client has entered the server", strlen("Client has entered the server"));
+    } else {
+        SSL_write(ssl, "Client entered wrong credentials", strlen("Client entered wrong credentials"));
+    }
+
+    // Close SSL connection and socket
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
     close(sock);
+    SSL_CTX_free(ctx);
 
     return 0;
 }
