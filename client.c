@@ -6,10 +6,15 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/sha.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/sendfile.h>
 
 #define PORT 8080
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE 4096
 #define MAX_CREDENTIAL_LENGTH 256
+#define CLIENT_FILE "client.txt"
+#define SERVER_FILE "server.txt"
 
 // Function to hash the password using SHA256
 void hash_password(const char *password, unsigned char *hashed_password) {
@@ -44,6 +49,77 @@ void hash_to_string(const unsigned char *hash, char *hash_string) {
         sprintf(hash_string + (i * 2), "%02x", hash[i]);
     }
     hash_string[SHA256_DIGEST_LENGTH * 2] = '\0';
+}
+
+// Function to send a file
+int send_file(SSL *ssl, const char *filename) {
+    char buffer[BUFFER_SIZE];
+    FILE *file = fopen(filename, "rb");
+    if (!file) {
+        perror("Error opening file");
+        return -1;
+    }
+
+    // Get file size
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    // Send file size
+    sprintf(buffer, "%ld", file_size);
+    SSL_write(ssl, buffer, strlen(buffer));
+
+    // Wait for server acknowledgment
+    SSL_read(ssl, buffer, BUFFER_SIZE);
+
+    // Send file content
+    size_t bytes_read;
+    size_t total_sent = 0;
+    while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {
+        SSL_write(ssl, buffer, bytes_read);
+        total_sent += bytes_read;
+        // Print progress
+        printf("\rUploading: %.2f%%", (float)total_sent * 100 / file_size);
+        fflush(stdout);
+    }
+    printf("\nUpload complete!\n");
+
+    fclose(file);
+    return 0;
+}
+
+// Function to receive a file
+int receive_file(SSL *ssl, const char *filename) {
+    char buffer[BUFFER_SIZE];
+    FILE *file = fopen(filename, "wb");
+    if (!file) {
+        perror("Error creating file");
+        return -1;
+    }
+
+    // Receive file size
+    int bytes = SSL_read(ssl, buffer, BUFFER_SIZE);
+    buffer[bytes] = '\0';
+    long file_size = atol(buffer);
+
+    // Send acknowledgment
+    SSL_write(ssl, "OK", 2);
+
+    // Receive file content
+    long total_received = 0;
+    while (total_received < file_size) {
+        bytes = SSL_read(ssl, buffer, BUFFER_SIZE);
+        if (bytes <= 0) break;
+        fwrite(buffer, 1, bytes, file);
+        total_received += bytes;
+        // Print progress
+        printf("\rDownloading: %.2f%%", (float)total_received * 100 / file_size);
+        fflush(stdout);
+    }
+    printf("\nDownload complete!\n");
+
+    fclose(file);
+    return 0;
 }
 
 int main() {
@@ -100,13 +176,13 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
+    printf("SSL Connection established\n");
+
     // Receive "Username: " prompt from server
     SSL_read(ssl, buffer, BUFFER_SIZE);
     printf("%s", buffer);
     fgets(username, BUFFER_SIZE, stdin);
-    // Remove newline character from username
     username[strcspn(username, "\n")] = 0;
-    // Send username to server
     SSL_write(ssl, username, strlen(username));
 
     // Receive "Password: " prompt from server
@@ -114,13 +190,11 @@ int main() {
     SSL_read(ssl, buffer, BUFFER_SIZE);
     printf("%s", buffer);
     fgets(password, BUFFER_SIZE, stdin);
-    // Remove newline character from password
     password[strcspn(password, "\n")] = 0;
 
     // Hash the password
     hash_password(password, hashed_password);
     hash_to_string(hashed_password, hashed_password_string);
-    // Send the hashed password string to the server
     SSL_write(ssl, hashed_password_string, strlen(hashed_password_string));
 
     // Receive authentication result from server
@@ -128,9 +202,53 @@ int main() {
     SSL_read(ssl, buffer, BUFFER_SIZE);
     printf("%s\n", buffer);
 
-    // Send appropriate message based on authentication result
     if (strstr(buffer, "Access Granted")) {
         SSL_write(ssl, "Client has entered the server", strlen("Client has entered the server"));
+        
+        // File transfer loop
+        while (1) {
+            char command[BUFFER_SIZE];
+            
+            printf("\nAvailable commands:\n");
+            printf("UPLOAD - Upload client.txt to server\n");
+            printf("DOWNLOAD - Download server.txt from server\n");
+            printf("LIST - List available files\n");
+            printf("EXIT - Close connection\n");
+            printf("Enter command: ");
+            
+            fgets(command, BUFFER_SIZE, stdin);
+            command[strcspn(command, "\n")] = 0;
+
+            // Send command to server
+            SSL_write(ssl, command, strlen(command));
+
+            if (strncmp(command, "EXIT", 4) == 0) {
+                printf("Closing connection...\n");
+                break;
+            } else if (strncmp(command, "UPLOAD", 6) == 0) {
+                printf("Uploading %s...\n", CLIENT_FILE);
+                if (send_file(ssl, CLIENT_FILE) == 0) {
+                    printf("File uploaded successfully\n");
+                } else {
+                    printf("Failed to upload file\n");
+                }
+            } else if (strncmp(command, "DOWNLOAD", 8) == 0) {
+                printf("Downloading %s...\n", SERVER_FILE);
+                if (receive_file(ssl, SERVER_FILE) == 0) {
+                    printf("File downloaded successfully\n");
+                } else {
+                    printf("Failed to download file\n");
+                }
+            } else if (strncmp(command, "LIST", 4) == 0) {
+                // Receive and display file list
+                memset(buffer, 0, BUFFER_SIZE);
+                int bytes = SSL_read(ssl, buffer, BUFFER_SIZE);
+                buffer[bytes] = '\0';
+                printf("Files on server:\n%s", buffer);
+            } else {
+                printf("Invalid command\n");
+            }
+        }
     } else {
         SSL_write(ssl, "Client entered wrong credentials", strlen("Client entered wrong credentials"));
     }
