@@ -7,12 +7,39 @@
 #include <openssl/err.h>
 #include <openssl/sha.h>
 #include <pthread.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/sendfile.h>
+#include <dirent.h>
+#include <time.h>
 
 #define PORT 8080
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE 4096
 #define MAX_CREDENTIAL_LENGTH 256
-#define CREDENTIALS_FILE "user_credentials.txt" // Define the credentials file
-#define MAX_CONNECTIONS 10                         // Maximum number of concurrent connections
+#define CREDENTIALS_FILE "user_credentials.txt"
+#define MAX_CONNECTIONS 10
+#define RECEIVED_DIR "received_files"
+#define SERVER_FILE "server.txt"
+#define LOG_FILE "server_log.txt"
+
+// Mutex for thread-safe logging
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Function to write to log file
+void write_log(const char *username, const char *action) {
+    pthread_mutex_lock(&log_mutex);
+    
+    FILE *log_file = fopen(LOG_FILE, "a");
+    if (log_file) {
+        time_t now = time(NULL);
+        char *timestamp = ctime(&now);
+        timestamp[strlen(timestamp) - 1] = '\0'; // Remove newline
+        fprintf(log_file, "[%s] User '%s': %s\n", timestamp, username, action);
+        fclose(log_file);
+    }
+    
+    pthread_mutex_unlock(&log_mutex);
+}
 
 // Function to hash the password using SHA256
 void hash_password(const char *password, unsigned char *hashed_password) {
@@ -54,23 +81,22 @@ int authenticate_user(const char *username, const char *hashed_password_string) 
     FILE *fp;
     char file_username[BUFFER_SIZE];
     char file_hashed_password[MAX_CREDENTIAL_LENGTH];
-    char line[BUFFER_SIZE * 2]; // Increased buffer size to handle long lines
+    char line[BUFFER_SIZE * 2];
     int authenticated = 0;
 
     fp = fopen(CREDENTIALS_FILE, "r");
     if (fp == NULL) {
         perror("Error opening credentials file");
-        return -1; // Indicate an error
+        return -1;
     }
 
-    while (fgets(line, sizeof(line), fp) != NULL) { // Use sizeof(line)
-        // Parse the line from the file
+    while (fgets(line, sizeof(line), fp) != NULL) {
         if (sscanf(line, "%s %s", file_username, file_hashed_password) == 2) {
-            // Remove newline characters if present
             file_username[strcspn(file_username, "\n")] = 0;
             file_hashed_password[strcspn(file_hashed_password, "\n")] = 0;
 
-            if (strcmp(username, file_username) == 0 && strcmp(hashed_password_string, file_hashed_password) == 0) {
+            if (strcmp(username, file_username) == 0 && 
+                strcmp(hashed_password_string, file_hashed_password) == 0) {
                 authenticated = 1;
                 break;
             }
@@ -80,16 +106,109 @@ int authenticate_user(const char *username, const char *hashed_password_string) 
     return authenticated;
 }
 
+// Function to send a file
+int send_file(SSL *ssl, const char *filename) {
+    char buffer[BUFFER_SIZE];
+    FILE *file = fopen(filename, "rb");
+    if (!file) {
+        perror("Error opening file");
+        return -1;
+    }
+
+    // Get file size
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    // Send file size
+    sprintf(buffer, "%ld", file_size);
+    SSL_write(ssl, buffer, strlen(buffer));
+
+    // Wait for client acknowledgment
+    SSL_read(ssl, buffer, BUFFER_SIZE);
+
+    // Send file content
+    size_t bytes_read;
+    size_t total_sent = 0;
+    while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {
+        SSL_write(ssl, buffer, bytes_read);
+        total_sent += bytes_read;
+        printf("\rSending: %.2f%%", (float)total_sent * 100 / file_size);
+        fflush(stdout);
+    }
+    printf("\nSend complete!\n");
+
+    fclose(file);
+    return 0;
+}
+
+// Function to receive a file
+int receive_file(SSL *ssl, const char *filename) {
+    char buffer[BUFFER_SIZE];
+    FILE *file = fopen(filename, "wb");
+    if (!file) {
+        perror("Error creating file");
+        return -1;
+    }
+
+    // Receive file size
+    int bytes = SSL_read(ssl, buffer, BUFFER_SIZE);
+    buffer[bytes] = '\0';
+    long file_size = atol(buffer);
+
+    // Send acknowledgment
+    SSL_write(ssl, "OK", 2);
+
+    // Receive file content
+    long total_received = 0;
+    while (total_received < file_size) {
+        bytes = SSL_read(ssl, buffer, BUFFER_SIZE);
+        if (bytes <= 0) break;
+        fwrite(buffer, 1, bytes, file);
+        total_received += bytes;
+        printf("\rReceiving: %.2f%%", (float)total_received * 100 / file_size);
+        fflush(stdout);
+    }
+    printf("\nReceive complete!\n");
+
+    fclose(file);
+    return 0;
+}
+
+// Function to list files
+void list_files(SSL *ssl) {
+    char file_list[BUFFER_SIZE] = "";
+    
+    // Add server.txt to the list
+    strcat(file_list, "server.txt\n");
+    
+    // List files in received_files directory
+    DIR *dir = opendir(RECEIVED_DIR);
+    if (dir != NULL) {
+        struct dirent *ent;
+        while ((ent = readdir(dir)) != NULL) {
+            if (ent->d_type == DT_REG) { // Regular file
+                strcat(file_list, RECEIVED_DIR);
+                strcat(file_list, "/");
+                strcat(file_list, ent->d_name);
+                strcat(file_list, "\n");
+            }
+        }
+        closedir(dir);
+    }
+    
+    SSL_write(ssl, file_list, strlen(file_list));
+}
+
 // Function to handle a single client connection
 void *handle_client(void *client_socket_ssl) {
     SSL *ssl = (SSL *)client_socket_ssl;
     char buffer[BUFFER_SIZE] = {0};
     char username[BUFFER_SIZE];
-    char hashed_password_string[MAX_CREDENTIAL_LENGTH]; // Receive hashed password as string
+    char hashed_password_string[MAX_CREDENTIAL_LENGTH];
     int auth_result;
     int client_sock;
 
-    // Detach the thread, so we don't need to join it later
     pthread_detach(pthread_self());
 
     if (ssl == NULL) {
@@ -103,7 +222,6 @@ void *handle_client(void *client_socket_ssl) {
         goto cleanup;
     }
 
-    // Perform SSL handshake
     if (SSL_accept(ssl) <= 0) {
         ERR_print_errors_fp(stderr);
         goto cleanup;
@@ -122,7 +240,7 @@ void *handle_client(void *client_socket_ssl) {
         goto cleanup;
     }
     strcpy(username, buffer);
-    username[strcspn(username, "\n")] = 0; // Remove newline
+    username[strcspn(username, "\n")] = 0;
     printf("Received username: %s\n", username);
 
     // Send "Password: " prompt to client
@@ -138,8 +256,7 @@ void *handle_client(void *client_socket_ssl) {
         goto cleanup;
     }
     strcpy(hashed_password_string, buffer);
-    hashed_password_string[strcspn(hashed_password_string, "\n")] = 0; // Remove newline
-    printf("Received hashed password: %s\n", hashed_password_string);
+    hashed_password_string[strcspn(hashed_password_string, "\n")] = 0;
 
     // Authenticate user
     auth_result = authenticate_user(username, hashed_password_string);
@@ -148,49 +265,77 @@ void *handle_client(void *client_socket_ssl) {
             perror("SSL_write (access granted) failed");
             goto cleanup;
         }
-        printf("Authentication successful\n");
+        write_log(username, "Authentication successful");
+        printf("Authentication successful for user: %s\n", username);
+
+        // Handle file transfer commands
+        while (1) {
+            memset(buffer, 0, BUFFER_SIZE);
+            int bytes = SSL_read(ssl, buffer, BUFFER_SIZE);
+            if (bytes <= 0) break;
+
+            buffer[bytes] = '\0';
+            printf("Received command from %s: %s\n", username, buffer);
+
+            if (strncmp(buffer, "EXIT", 4) == 0) {
+                write_log(username, "Disconnected");
+                break;
+            } else if (strncmp(buffer, "UPLOAD", 6) == 0) {
+                char filepath[BUFFER_SIZE];
+                snprintf(filepath, sizeof(filepath), "%s/%s_client.txt", RECEIVED_DIR, username);
+                if (receive_file(ssl, filepath) == 0) {
+                    write_log(username, "Uploaded file successfully");
+                    printf("File received from %s\n", username);
+                } else {
+                    write_log(username, "Failed to upload file");
+                }
+            } else if (strncmp(buffer, "DOWNLOAD", 8) == 0) {
+                if (send_file(ssl, SERVER_FILE) == 0) {
+                    write_log(username, "Downloaded file successfully");
+                    printf("File sent to %s\n", username);
+                } else {
+                    write_log(username, "Failed to download file");
+                }
+            } else if (strncmp(buffer, "LIST", 4) == 0) {
+                list_files(ssl);
+                write_log(username, "Listed files");
+            }
+        }
     } else if (auth_result == 0) {
         if (SSL_write(ssl, "Access Denied", strlen("Access Denied")) <= 0) {
             perror("SSL_write (access denied) failed");
             goto cleanup;
         }
-        printf("Authentication failed\n");
+        write_log(username, "Authentication failed");
+        printf("Authentication failed for user: %s\n", username);
     } else {
         if (SSL_write(ssl, "Authentication Error", strlen("Authentication Error")) <= 0) {
             perror("SSL_write (auth error) failed");
             goto cleanup;
         }
-        printf("Authentication error\n");
+        write_log(username, "Authentication error");
+        printf("Authentication error for user: %s\n", username);
     }
-
-    // Receive message from client
-    memset(buffer, 0, BUFFER_SIZE);
-    if (SSL_read(ssl, buffer, BUFFER_SIZE) <= 0) {
-        perror("SSL_read (message) failed");
-        goto cleanup;
-    }
-    printf("Received message from client: %s\n", buffer);
 
 cleanup:
-    // Close SSL connection and socket
     if (ssl != NULL) {
         SSL_shutdown(ssl);
         SSL_free(ssl);
         close(client_sock);
     }
-    //  if (ctx != NULL) {  // Remove this line, it is already freed in main()
-    //      SSL_CTX_free(ctx);
-    //  }
     return NULL;
 }
 
 int main() {
-    int sock, client_sock; // Declare client_sock here
+    int sock, client_sock;
     struct sockaddr_in server_address, client_address;
     socklen_t client_address_len;
     SSL_CTX *ctx;
     SSL *ssl;
     pthread_t thread_id;
+
+    // Create received files directory if it doesn't exist
+    mkdir(RECEIVED_DIR, 0755);
 
     // Initialize SSL library
     if (SSL_library_init() != 1) {
@@ -209,11 +354,11 @@ int main() {
     }
 
     // Load certificate and private key
-    if (SSL_CTX_use_certificate_file(ctx, "/home/kali/server.crt", SSL_FILETYPE_PEM) <= 0) {
+    if (SSL_CTX_use_certificate_file(ctx, "server.crt", SSL_FILETYPE_PEM) <= 0) {
         ERR_print_errors_fp(stderr);
         exit(EXIT_FAILURE);
     }
-    if (SSL_CTX_use_PrivateKey_file(ctx, "/home/kali/server.key", SSL_FILETYPE_PEM) <= 0) {
+    if (SSL_CTX_use_PrivateKey_file(ctx, "server.key", SSL_FILETYPE_PEM) <= 0) {
         ERR_print_errors_fp(stderr);
         exit(EXIT_FAILURE);
     }
@@ -248,39 +393,27 @@ int main() {
 
     printf("Server listening on port %d\n", PORT);
 
-    // Accept connections in a loop
     while (1) {
         client_address_len = sizeof(client_address);
         client_sock = accept(sock, (struct sockaddr *)&client_address, &client_address_len);
         if (client_sock < 0) {
             perror("Accept failed");
-            continue; // Go back to accepting connections
+            continue;
         }
 
-        printf("Connection from %s:%d\n", inet_ntoa(client_address.sin_addr), ntohs(client_address.sin_port));
-
-        // Create SSL object
         ssl = SSL_new(ctx);
-        if (ssl == NULL) {
-            fprintf(stderr, "SSL_new failed\n");
+        SSL_set_fd(ssl, client_sock);
+
+        // Create new thread for client
+        if (pthread_create(&thread_id, NULL, handle_client, ssl) < 0) {
+            perror("Could not create thread");
+            SSL_free(ssl);
             close(client_sock);
             continue;
         }
-        SSL_set_fd(ssl, client_sock);
-
-        // Create a thread to handle the client
-        if (pthread_create(&thread_id, NULL, handle_client, ssl) != 0) {
-            perror("pthread_create failed");
-            SSL_free(ssl);
-            close(client_sock);
-            continue; // Go back to accepting connections
-        }
-        //ssl is passed to the thread
     }
 
-    close(sock);
     SSL_CTX_free(ctx);
+    close(sock);
     return 0;
 }
-
-
