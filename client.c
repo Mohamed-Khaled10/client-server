@@ -5,9 +5,46 @@
 #include <arpa/inet.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/sha.h>
 
 #define PORT 8080
 #define BUFFER_SIZE 1024
+#define MAX_CREDENTIAL_LENGTH 256
+
+// Function to hash the password using SHA256
+void hash_password(const char *password, unsigned char *hashed_password) {
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    const EVP_MD *md = EVP_get_digestbyname("SHA256");
+    if (!md) {
+        fprintf(stderr, "SHA256 algorithm not found\n");
+        exit(EXIT_FAILURE);
+    }
+    if (!mdctx) {
+        fprintf(stderr, "Error creating digest context\n");
+        exit(EXIT_FAILURE);
+    }
+    if (EVP_DigestInit_ex(mdctx, md, NULL) != 1) {
+        fprintf(stderr, "Error initializing digest\n");
+        exit(EXIT_FAILURE);
+    }
+    if (EVP_DigestUpdate(mdctx, password, strlen(password)) != 1) {
+        fprintf(stderr, "Error updating digest\n");
+        exit(EXIT_FAILURE);
+    }
+    if (EVP_DigestFinal_ex(mdctx, hashed_password, NULL) != 1) {
+        fprintf(stderr, "Error finalizing digest\n");
+        exit(EXIT_FAILURE);
+    }
+    EVP_MD_CTX_free(mdctx);
+}
+
+// Function to convert the hashed password to a string
+void hash_to_string(const unsigned char *hash, char *hash_string) {
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+        sprintf(hash_string + (i * 2), "%02x", hash[i]);
+    }
+    hash_string[SHA256_DIGEST_LENGTH * 2] = '\0';
+}
 
 int main() {
     int sock;
@@ -16,6 +53,8 @@ int main() {
     SSL *ssl;
     char buffer[BUFFER_SIZE] = {0};
     char username[BUFFER_SIZE], password[BUFFER_SIZE];
+    unsigned char hashed_password[SHA256_DIGEST_LENGTH];
+    char hashed_password_string[SHA256_DIGEST_LENGTH * 2 + 1];
 
     // Initialize SSL library
     SSL_library_init();
@@ -40,7 +79,10 @@ int main() {
     // Define server address
     server_address.sin_family = AF_INET;
     server_address.sin_port = htons(PORT);
-    server_address.sin_addr.s_addr = INADDR_ANY;
+    if (inet_pton(AF_INET, "127.0.0.1", &server_address.sin_addr) <= 0) {
+        perror("Invalid address/Address not supported");
+        exit(EXIT_FAILURE);
+    }
 
     // Connect to server
     if (connect(sock, (struct sockaddr*)&server_address, sizeof(server_address)) < 0) {
@@ -74,8 +116,12 @@ int main() {
     fgets(password, BUFFER_SIZE, stdin);
     // Remove newline character from password
     password[strcspn(password, "\n")] = 0;
-    // Send password to server
-    SSL_write(ssl, password, strlen(password));
+
+    // Hash the password
+    hash_password(password, hashed_password);
+    hash_to_string(hashed_password, hashed_password_string);
+    // Send the hashed password string to the server
+    SSL_write(ssl, hashed_password_string, strlen(hashed_password_string));
 
     // Receive authentication result from server
     memset(buffer, 0, BUFFER_SIZE);
