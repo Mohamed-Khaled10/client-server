@@ -1,0 +1,22 @@
+[Mon Apr 21 14:19:59 2025] User 'user1': Authentication successful
+[Mon Apr 21 14:20:57 2025] User 'user1': Listed files
+[Mon Apr 21 14:21:43 2025] User 'user1': Uploaded file successfully
+[Mon Apr 21 14:22:28 2025] User 'user1': Downloaded file successfully
+[Mon Apr 21 14:23:18 2025] User 'user1': Disconnected
+[Mon Apr 21 15:02:34 2025] User 'user1': Authentication successful
+[Mon Apr 21 15:03:08 2025] User 'user1': Disconnected
+[Mon Apr 21 15:03:18 2025] User 'user2': Authentication successful
+[Mon Apr 21 15:03:26 2025] User 'user2': Uploaded file successfully
+[Tue Apr 22 11:41:19 2025] User 'user1': Authentication successful
+[Tue Apr 22 11:41:19 2025] User 'user1': Attempted invalid command
+[Tue Apr 22 11:41:29 2025] User 'user1': Disconnected
+[Tue Apr 22 11:41:45 2025] User 'user2': Authentication successful
+[Tue Apr 22 11:41:45 2025] User 'user2': Attempted invalid command
+[Tue Apr 22 11:42:06 2025] User 'user2': Uploaded file successfully
+[Tue Apr 22 11:42:45 2025] User 'user3': Authentication successful
+[Tue Apr 22 11:42:45 2025] User 'user3': Attempted invalid command
+[Tue Apr 22 11:43:25 2025] User 'user3': Attempted to delete file without permission
+[Tue Apr 22 11:44:00 2025] User 'user3': Attempted upload without permission
+[Tue Apr 22 11:44:00 2025] User 'user3': Attempted invalid command
+[Tue Apr 22 11:44:00 2025] User 'user3': Attempted invalid command
+[Tue Apr 22 11:44:13 2025] User 'user3': Listed files
