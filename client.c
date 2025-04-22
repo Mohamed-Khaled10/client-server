@@ -213,6 +213,8 @@ int main() {
             printf("UPLOAD - Upload client.txt to server\n");
             printf("DOWNLOAD - Download server.txt from server\n");
             printf("LIST - List available files\n");
+            printf("CAT <filename> - Read file content\n");
+            printf("DELETE <filename> - Delete a file\n");
             printf("EXIT - Close connection\n");
             printf("Enter command: ");
             
@@ -245,8 +247,36 @@ int main() {
                 int bytes = SSL_read(ssl, buffer, BUFFER_SIZE);
                 buffer[bytes] = '\0';
                 printf("Files on server:\n%s", buffer);
+            } else if (strncmp(command, "CAT", 3) == 0) {
+                // Receive and display file content
+                memset(buffer, 0, BUFFER_SIZE);
+                int bytes = SSL_read(ssl, buffer, BUFFER_SIZE);
+                buffer[bytes] = '\0';
+                if (strstr(buffer, "Permission denied")) {
+                    printf("Permission denied: You don't have permission to read files\n");
+                } else if (strstr(buffer, "File not found")) {
+                    printf("File not found\n");
+                } else {
+                    printf("File content:\n%s\n", buffer);
+                }
+            } else if (strncmp(command, "DELETE", 6) == 0) {
+                // Receive delete operation result
+                memset(buffer, 0, BUFFER_SIZE);
+                int bytes = SSL_read(ssl, buffer, BUFFER_SIZE);
+                buffer[bytes] = '\0';
+                if (strstr(buffer, "Permission denied")) {
+                    printf("Permission denied: You don't have permission to delete files\n");
+                } else if (strstr(buffer, "Failed")) {
+                    printf("Failed to delete file\n");
+                } else {
+                    printf("File deleted successfully\n");
+                }
             } else {
-                printf("Invalid command\n");
+                // Receive error message
+                memset(buffer, 0, BUFFER_SIZE);
+                int bytes = SSL_read(ssl, buffer, BUFFER_SIZE);
+                buffer[bytes] = '\0';
+                printf("Error: %s\n", buffer);
             }
         }
     } else {
