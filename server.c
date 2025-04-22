@@ -22,6 +22,11 @@
 #define SERVER_FILE "server.txt"
 #define LOG_FILE "server_log.txt"
 
+// Permission levels
+#define PERM_READ_ONLY 1
+#define PERM_READ_WRITE 2
+#define PERM_FULL_ACCESS 3
+
 // Mutex for thread-safe logging
 pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -76,8 +81,8 @@ void hash_to_string(const unsigned char *hash, char *hash_string) {
     hash_string[SHA256_DIGEST_LENGTH * 2] = '\0';
 }
 
-// Function to authenticate the user
-int authenticate_user(const char *username, const char *hashed_password_string) {
+// Function to authenticate the user and get permission level
+int authenticate_user(const char *username, const char *hashed_password_string, int *permission_level) {
     FILE *fp;
     char file_username[BUFFER_SIZE];
     char file_hashed_password[MAX_CREDENTIAL_LENGTH];
@@ -91,19 +96,26 @@ int authenticate_user(const char *username, const char *hashed_password_string) 
     }
 
     while (fgets(line, sizeof(line), fp) != NULL) {
-        if (sscanf(line, "%s %s", file_username, file_hashed_password) == 2) {
-            file_username[strcspn(file_username, "\n")] = 0;
-            file_hashed_password[strcspn(file_hashed_password, "\n")] = 0;
-
-            if (strcmp(username, file_username) == 0 && 
-                strcmp(hashed_password_string, file_hashed_password) == 0) {
-                authenticated = 1;
-                break;
+        char *token = strtok(line, ":");
+        if (token && strcmp(username, token) == 0) {
+            token = strtok(NULL, ":");
+            if (token && strcmp(hashed_password_string, token) == 0) {
+                token = strtok(NULL, ":");
+                if (token) {
+                    *permission_level = atoi(token);
+                    authenticated = 1;
+                    break;
+                }
             }
         }
     }
     fclose(fp);
     return authenticated;
+}
+
+// Function to check if user has required permission
+int check_permission(int user_permission, int required_permission) {
+    return user_permission >= required_permission;
 }
 
 // Function to send a file
@@ -175,6 +187,14 @@ int receive_file(SSL *ssl, const char *filename) {
     return 0;
 }
 
+// Function to delete a file
+int delete_file(const char *filename) {
+    if (remove(filename) == 0) {
+        return 0;
+    }
+    return -1;
+}
+
 // Function to list files
 void list_files(SSL *ssl) {
     char file_list[BUFFER_SIZE] = "";
@@ -208,6 +228,7 @@ void *handle_client(void *client_socket_ssl) {
     char hashed_password_string[MAX_CREDENTIAL_LENGTH];
     int auth_result;
     int client_sock;
+    int permission_level = 0;
 
     pthread_detach(pthread_self());
 
@@ -258,15 +279,15 @@ void *handle_client(void *client_socket_ssl) {
     strcpy(hashed_password_string, buffer);
     hashed_password_string[strcspn(hashed_password_string, "\n")] = 0;
 
-    // Authenticate user
-    auth_result = authenticate_user(username, hashed_password_string);
+    // Authenticate user and get permission level
+    auth_result = authenticate_user(username, hashed_password_string, &permission_level);
     if (auth_result == 1) {
         if (SSL_write(ssl, "Access Granted", strlen("Access Granted")) <= 0) {
             perror("SSL_write (access granted) failed");
             goto cleanup;
         }
         write_log(username, "Authentication successful");
-        printf("Authentication successful for user: %s\n", username);
+        printf("Authentication successful for user: %s (Permission level: %d)\n", username, permission_level);
 
         // Handle file transfer commands
         while (1) {
@@ -281,6 +302,11 @@ void *handle_client(void *client_socket_ssl) {
                 write_log(username, "Disconnected");
                 break;
             } else if (strncmp(buffer, "UPLOAD", 6) == 0) {
+                if (!check_permission(permission_level, PERM_READ_WRITE)) {
+                    SSL_write(ssl, "Permission denied", strlen("Permission denied"));
+                    write_log(username, "Attempted upload without permission");
+                    continue;
+                }
                 char filepath[BUFFER_SIZE];
                 snprintf(filepath, sizeof(filepath), "%s/%s_client.txt", RECEIVED_DIR, username);
                 if (receive_file(ssl, filepath) == 0) {
@@ -290,6 +316,11 @@ void *handle_client(void *client_socket_ssl) {
                     write_log(username, "Failed to upload file");
                 }
             } else if (strncmp(buffer, "DOWNLOAD", 8) == 0) {
+                if (!check_permission(permission_level, PERM_READ_ONLY)) {
+                    SSL_write(ssl, "Permission denied", strlen("Permission denied"));
+                    write_log(username, "Attempted download without permission");
+                    continue;
+                }
                 if (send_file(ssl, SERVER_FILE) == 0) {
                     write_log(username, "Downloaded file successfully");
                     printf("File sent to %s\n", username);
@@ -297,8 +328,51 @@ void *handle_client(void *client_socket_ssl) {
                     write_log(username, "Failed to download file");
                 }
             } else if (strncmp(buffer, "LIST", 4) == 0) {
+                if (!check_permission(permission_level, PERM_READ_ONLY)) {
+                    SSL_write(ssl, "Permission denied", strlen("Permission denied"));
+                    write_log(username, "Attempted to list files without permission");
+                    continue;
+                }
                 list_files(ssl);
                 write_log(username, "Listed files");
+            } else if (strncmp(buffer, "DELETE", 6) == 0) {
+                if (!check_permission(permission_level, PERM_FULL_ACCESS)) {
+                    SSL_write(ssl, "Permission denied", strlen("Permission denied"));
+                    write_log(username, "Attempted to delete file without permission");
+                    continue;
+                }
+                char filename[BUFFER_SIZE];
+                snprintf(filename, sizeof(filename), "%s/%s", RECEIVED_DIR, buffer + 7);
+                if (delete_file(filename) == 0) {
+                    SSL_write(ssl, "File deleted successfully", strlen("File deleted successfully"));
+                    write_log(username, "Deleted file successfully");
+                } else {
+                    SSL_write(ssl, "Failed to delete file", strlen("Failed to delete file"));
+                    write_log(username, "Failed to delete file");
+                }
+            } else if (strncmp(buffer, "CAT", 3) == 0) {
+                if (!check_permission(permission_level, PERM_READ_ONLY)) {
+                    SSL_write(ssl, "Permission denied", strlen("Permission denied"));
+                    write_log(username, "Attempted to read file without permission");
+                    continue;
+                }
+                char filename[BUFFER_SIZE];
+                snprintf(filename, sizeof(filename), "%s/%s", RECEIVED_DIR, buffer + 4);
+                FILE *file = fopen(filename, "r");
+                if (file) {
+                    char content[BUFFER_SIZE];
+                    size_t bytes_read = fread(content, 1, BUFFER_SIZE - 1, file);
+                    content[bytes_read] = '\0';
+                    SSL_write(ssl, content, bytes_read);
+                    fclose(file);
+                    write_log(username, "Read file content");
+                } else {
+                    SSL_write(ssl, "File not found", strlen("File not found"));
+                    write_log(username, "Attempted to read non-existent file");
+                }
+            } else {
+                SSL_write(ssl, "Invalid command", strlen("Invalid command"));
+                write_log(username, "Attempted invalid command");
             }
         }
     } else if (auth_result == 0) {
